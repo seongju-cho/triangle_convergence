@@ -1,0 +1,6 @@
+# charts for `--plot` / `--plot-dir`
+matplotlib>=3.7
+# full, up-to-date KOSPI/KOSDAQ listings
+pykrx>=1.0.45
+# test suite
+pytest>=7.0
