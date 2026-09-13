@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import random
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Callable, Sequence
@@ -60,6 +61,8 @@ def scan_market(
     symbols: Sequence[str] | None = None,
     universe_file: str | None = None,
     limit: int | None = None,
+    sample: int | None = None,
+    sample_seed: int = 0,
     offline_universe: bool = False,
     progress: ProgressFn | None = None,
 ) -> ScanReport:
@@ -75,6 +78,10 @@ def scan_market(
         codes = load_universe(market.key, limit=limit, offline=offline_universe)
     if limit:
         codes = codes[:limit]
+    if sample and sample < len(codes):
+        # a leading slice of an alphabetical listing is mostly micro caps,
+        # so a seeded random sample is the better smoke test
+        codes = sorted(random.Random(sample_seed).sample(codes, sample))
 
     report = ScanReport()
     total = len(codes)

@@ -108,3 +108,72 @@ def write_json(report: ScanReport, path: str | Path) -> Path:
     }
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
     return path
+
+
+HTML_COLUMNS = [
+    ("market", "Market"),
+    ("code", "Code"),
+    ("score", "Score"),
+    ("status", "Status"),
+    ("break_date", "Breakout"),
+    ("bars_since_break", "Age"),
+    ("last_close", "Close"),
+    ("upper_now", "Resistance"),
+    ("break_excess_pct", "Excess %"),
+    ("volume_ratio", "Vol x"),
+    ("extension_pct", "Ext %"),
+    ("channel_width_pct", "Width %"),
+    ("slope_upper_pct_per_day", "Slope %/d"),
+    ("touches_upper", "Touch"),
+    ("lookback", "Lookback"),
+]
+
+_CELL = "padding:6px 10px;border-bottom:1px solid #e5e7eb;font-size:13px;"
+_HEAD = "padding:6px 10px;border-bottom:2px solid #d0d7de;font-size:12px;text-align:left;color:#57606a;"
+
+
+def format_html(report: ScanReport, hits: Sequence[Hit] | None = None, title: str = "") -> str:
+    """Email-friendly HTML summary; `hits` defaults to every hit in the report."""
+    rows = hits if hits is not None else report.hits
+    heading = title or "Ascending-channel breakouts"
+
+    parts = [
+        '<div style="font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;color:#1f2328;">',
+        f'<h2 style="margin:0 0 4px;font-size:18px;">{_esc(heading)}</h2>',
+        f'<p style="margin:0 0 16px;color:#57606a;font-size:13px;">'
+        f"{_esc(format_summary(report))}</p>",
+    ]
+
+    if not rows:
+        parts.append('<p style="font-size:14px;">No new breakouts today.</p>')
+    else:
+        parts.append('<table cellpadding="0" cellspacing="0" style="border-collapse:collapse;">')
+        parts.append("<tr>" + "".join(f'<th style="{_HEAD}">{_esc(t)}</th>' for _, t in HTML_COLUMNS) + "</tr>")
+        for hit in rows:
+            row = hit.as_row()
+            cells = []
+            for key, _ in HTML_COLUMNS:
+                value = row.get(key, "")
+                text = f"{value:,.2f}" if isinstance(value, float) else str(value)
+                weight = "font-weight:600;" if key in ("code", "score") else ""
+                cells.append(f'<td style="{_CELL}{weight}">{_esc(text)}</td>')
+            parts.append("<tr>" + "".join(cells) + "</tr>")
+        parts.append("</table>")
+
+    parts.append(
+        '<p style="margin:18px 0 0;color:#57606a;font-size:12px;">'
+        "Score = channel quality (touches, containment, parallelism) + breakout strength "
+        "(excess over resistance, volume, freshness). Pattern detection only — not investment advice."
+        "</p></div>"
+    )
+    return "\n".join(parts)
+
+
+def _esc(text: str) -> str:
+    return (
+        str(text)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )

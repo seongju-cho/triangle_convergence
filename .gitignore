@@ -9,4 +9,8 @@ dist/
 venv/
 out/
 charts/
+logs/
 *.png
+
+# local settings (contains your email address / SMTP account)
+monitor.config.json

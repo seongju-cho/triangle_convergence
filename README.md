@@ -20,6 +20,8 @@ pip install -r requirements.txt          # 필수: numpy, pandas, requests, yfin
 pip install matplotlib pykrx             # 선택: 차트 이미지 / KOSPI 전체 종목 리스트
 ```
 
+Python 3.10 이상을 권장합니다. 이메일 발송은 표준 라이브러리(`smtplib`)만 사용하므로 추가 설치가 없습니다.
+
 ## 빠른 시작
 
 ```bash
@@ -39,6 +41,15 @@ python -m channel_monitor watch --interval 60 --webhook "$SLACK_WEBHOOK_URL"
 # 4) 유니버스 확인
 python -m channel_monitor universe kospi | head
 ```
+
+> `--limit N` 은 상장 파일의 **알파벳 앞 N개**만 가져옵니다(AACB, AACG, ...). 대부분 초소형주라
+> 유동성 필터에서 절반 이상 걸러지고 히트가 거의 안 나옵니다. 맛보기 스캔은 `--sample N`
+> (시드 고정 무작위 표본)이나 `--symbols` 를 쓰고, 실제 스크리닝은 전체 유니버스로 돌리세요.
+>
+> ```bash
+> python -m channel_monitor scan --markets nasdaq --sample 200     # 무작위 200종목
+> python -m channel_monitor scan --markets nasdaq                  # 전체 (권장)
+> ```
 
 `pip install -e .` 로 설치하면 `channel-monitor scan ...` 형태로도 실행됩니다.
 
@@ -118,6 +129,91 @@ nasdaq  TXG       77.60 breakout  2026-06-03     2   1.31   2.87   4.61   11.10 
 - `--symbols TXG,NVDA` 또는 `--universe-file list.txt` 로 유니버스를 직접 지정할 수 있습니다.
 - 유동성 필터는 시장별 기본값이 다릅니다(KRW/USD). `--min-price`, `--min-avg-volume`, `--min-avg-turnover` 로 덮어쓰세요.
 
+## 매일 자동 실행 + 이메일 알림
+
+`daily` 명령이 한 번의 스케줄 실행을 담당합니다: 스캔 → **처음 발견된 돌파만** 추려서 → HTML 표 +
+CSV + 차트를 이메일로 발송. 이미 알린 종목은 `state_file`에 기록되어 다음 날 다시 메일이 오지 않습니다.
+
+### 1. 설정 파일 만들기
+
+```bash
+python -m channel_monitor init-config          # monitor.config.json 생성
+```
+
+```jsonc
+{
+  "markets": ["nasdaq", "kospi"],
+  "lookbacks": [90, 120, 150],
+  "min_score": 55.0,          // 점수 커트라인
+  "require_volume": false,    // true면 거래량 급증 없는 돌파 제외
+  "out_dir": "out",           // CSV/HTML/차트 저장 위치
+  "state_file": ".cache/alerts.json",   // 중복 알림 방지 기록
+  "plot": true,
+  "email": {
+    "enabled": true,
+    "smtp_host": "smtp.gmail.com",
+    "smtp_port": 587,
+    "username": "you@gmail.com",
+    "password_env": "CHANNEL_MONITOR_SMTP_PASSWORD",   // 비밀번호는 환경변수로만
+    "sender": "you@gmail.com",
+    "recipients": ["you@gmail.com"],
+    "send_when_empty": false,  // true면 히트 0건일 때도 "없음" 메일 발송
+    "attach_csv": true,
+    "attach_charts": true,
+    "max_charts": 8
+  }
+}
+```
+
+### 2. 메일 비밀번호 (Gmail 기준)
+
+Gmail은 계정 비밀번호로 SMTP 로그인이 안 됩니다. 2단계 인증을 켠 뒤
+[앱 비밀번호](https://myaccount.google.com/apppasswords)를 발급해 환경변수에 저장하세요.
+설정 파일에는 비밀번호를 적지 않습니다.
+
+```powershell
+# Windows (PowerShell) — 새 터미널부터 적용됩니다
+setx CHANNEL_MONITOR_SMTP_PASSWORD "abcd efgh ijkl mnop"
+```
+
+네이버 메일은 `smtp.naver.com` / 465 / `"use_ssl": true`, 아웃룩은 `smtp-mail.outlook.com` / 587 입니다.
+
+### 3. 수동 테스트
+
+```powershell
+python -m channel_monitor daily --dry-run      # 스캔 + 리포트 생성, 메일은 보내지 않음
+start outeport-2026-09-13.html               # 생성된 메일 본문 확인
+python -m channel_monitor daily                # 실제 발송
+```
+
+### 4. Windows 작업 스케줄러 등록
+
+```powershell
+cd C:\path\to\triangle_convergence
+powershell -ExecutionPolicy Bypass -File scripts\register_task.ps1 -Time 07:30
+```
+
+| 명령 | 용도 |
+|---|---|
+| `Start-ScheduledTask -TaskName ChannelMonitorDaily` | 지금 즉시 한 번 실행 |
+| `Get-ScheduledTaskInfo -TaskName ChannelMonitorDaily` | 마지막 실행 시각 / 결과 코드 |
+| `Unregister-ScheduledTask -TaskName ChannelMonitorDaily -Confirm:$false` | 등록 해제 |
+
+- **07:30(KST)** 은 미국 장 마감(한국시간 새벽) 데이터가 확정된 직후이고, 코스피는 전일 종가 기준이 됩니다.
+- 코스피 당일 종가까지 보려면 `-Time 07:30,17:30` 으로 등록하고 설정의 `cache_ttl` 을 `6` 으로 낮추세요.
+- 기본값은 **로그인 상태에서만** 실행됩니다. 로그오프 상태에서도 돌리려면 `-RunWhetherLoggedOn` 을
+  추가하세요(계정 암호를 Windows가 저장합니다).
+- PC가 절전 중이면 `-WakeToRun`/`-StartWhenAvailable` 설정으로 깨우거나 다음 부팅 직후 따라잡습니다.
+- 실행 로그: `logs\daily.log`(애플리케이션), `logs\daily.out.log`(표준 출력 + 종료 코드).
+
+### macOS / Linux
+
+```bash
+crontab -e
+# 평일 07:30에 실행 (절대 경로 필수)
+30 7 * * 1-6 /Users/you/projects/triangle_convergence/scripts/run_daily.sh
+```
+
 ## 파라미터 튜닝
 
 기본값은 "6개월 채널 + 최근 5일 내 돌파"에 맞춰져 있습니다. 신호가 너무 적거나 많으면:
@@ -139,7 +235,7 @@ python -m channel_monitor scan --require-volume --min-volume-ratio 1.8 --min-bre
 ## 테스트
 
 ```bash
-python -m pytest -q          # 62 tests: 피벗/추세선/채널/데이터/스크리너/CLI
+python -m pytest -q          # 88 tests: 피벗/추세선/채널/데이터/메일/스크리너/CLI
 python -m channel_monitor selftest --plot-dir charts   # 합성 패턴 5종 판정 + 차트
 python examples/pattern_demo.py --out-dir charts       # 돌파/유지/되돌림/저거래량 비교
 ```

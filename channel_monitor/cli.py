@@ -6,15 +6,18 @@ import argparse
 import logging
 import sys
 import time
+from datetime import date
 from pathlib import Path
 
 from . import report as reporting
 from .channel import detect
 from .config import ChannelConfig, ScreenConfig
 from .data import LoaderConfig, PriceLoader
+from .mailer import send_email, send_message
 from .markets import DEFAULT_MARKETS, MARKETS, get_market
 from .notify import AlertState, format_alert, post_webhook
 from .screener import ScanReport, explain_symbol, scan_market
+from .settings import DailySettings, load_settings, write_example_config
 from .universe import load_universe
 
 DEFAULT_LOOKBACKS = (90, 120, 150)
@@ -49,6 +52,14 @@ def build_parser() -> argparse.ArgumentParser:
     explain.add_argument("--market", default="nasdaq", choices=sorted(MARKETS))
     explain.add_argument("--plot", help="write a chart to this path")
 
+    daily = sub.add_parser("daily", help="one scheduled run: scan, then email new breakouts")
+    daily.add_argument("--config", help="settings JSON (default: monitor.config.json if present)")
+    daily.add_argument("--dry-run", action="store_true", help="render the report but send no email")
+    daily.add_argument("--no-email", action="store_true", help="skip email delivery for this run")
+
+    init = sub.add_parser("init-config", help="write a starter settings file")
+    init.add_argument("path", nargs="?", default="monitor.config.json")
+
     uni = sub.add_parser("universe", help="print a market universe")
     uni.add_argument("market", choices=sorted(MARKETS))
     uni.add_argument("--limit", type=int)
@@ -67,7 +78,9 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument("--symbols", help="comma-separated tickers instead of the full universe")
     p.add_argument("--universe-file", help="file with one ticker per line")
-    p.add_argument("--limit", type=int, help="cap the number of tickers per market")
+    p.add_argument("--limit", type=int, help="take the first N tickers of the listing (alphabetical)")
+    p.add_argument("--sample", type=int, help="take a random N tickers instead of the alphabetical head")
+    p.add_argument("--sample-seed", type=int, default=0)
     p.add_argument("--offline-universe", action="store_true", help="skip listing downloads")
 
     p.add_argument("--lookbacks", default=",".join(str(x) for x in DEFAULT_LOOKBACKS))
@@ -160,6 +173,8 @@ def run_scan(args) -> ScanReport:
             symbols=symbols,
             universe_file=args.universe_file,
             limit=args.limit,
+            sample=args.sample,
+            sample_seed=args.sample_seed,
             offline_universe=args.offline_universe,
             progress=_progress,
         )
@@ -172,22 +187,31 @@ def run_scan(args) -> ScanReport:
     return merged
 
 
-def render_plots(args, hits, loader) -> None:
-    if not getattr(args, "plot_dir", None) or not hits:
-        return
-    from .plotting import plot_channel
+def _render_charts(hits, loader, out_dir: Path) -> list[Path]:
+    try:
+        from .plotting import plot_channel
+    except ImportError:
+        print("matplotlib not installed; skipping charts", file=sys.stderr)
+        return []
 
-    out = Path(args.plot_dir)
+    written: list[Path] = []
     for hit in hits:
         df = loader.load(hit.symbol)
         if df is None:
             continue
-        path = out / f"{hit.market}_{hit.code}_{hit.result.break_date}.png"
+        path = out_dir / f"{hit.market}_{hit.code}_{hit.result.break_date}.png"
         try:
             plot_channel(df, hit.result, path, title=f"{hit.market.upper()} {hit.code}")
             print(f"  chart: {path}", file=sys.stderr)
+            written.append(path)
         except Exception as exc:
             print(f"  chart failed for {hit.code}: {exc}", file=sys.stderr)
+    return written
+
+
+def render_plots(args, hits, loader) -> None:
+    if getattr(args, "plot_dir", None) and hits:
+        _render_charts(hits, loader, Path(args.plot_dir))
 
 
 def cmd_scan(args) -> int:
@@ -237,6 +261,141 @@ def cmd_explain(args) -> int:
     return 0 if result.ok else 1
 
 
+def _resolve_settings(args) -> DailySettings:
+    if args.config:
+        return load_settings(args.config)
+    default = Path("monitor.config.json")
+    if default.exists():
+        return load_settings(default)
+    print(
+        "no monitor.config.json found; running with defaults and no email\n"
+        "  create one with: python -m channel_monitor init-config",
+        file=sys.stderr,
+    )
+    settings = DailySettings()
+    settings.email.enabled = False
+    return settings
+
+
+def _attach_file_log(path: str) -> None:
+    if not path:
+        return
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.FileHandler(target, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    root = logging.getLogger()
+    root.addHandler(handler)
+    root.setLevel(min(root.level or logging.INFO, logging.INFO))
+
+
+def _scan_with_settings(settings: DailySettings, loader: PriceLoader, cfg: ChannelConfig) -> ScanReport:
+    merged = ScanReport()
+    for key in settings.markets:
+        market = get_market(key)
+        part = scan_market(
+            market.key,
+            loader=loader,
+            channel_cfg=cfg,
+            screen_cfg=market.screen.replace(history_days=settings.history_days),
+            lookbacks=settings.lookbacks,
+            symbols=settings.symbols or None,
+            universe_file=settings.universe_file or None,
+            limit=settings.limit,
+            sample=settings.sample,
+            offline_universe=settings.offline_universe,
+        )
+        logging.getLogger(__name__).info("[%s] %s", market.label, reporting.format_summary(part))
+        print(f"[{market.label}] {reporting.format_summary(part)}", file=sys.stderr)
+        merged.hits.extend(part.hits)
+        merged.scanned += part.scanned
+        merged.skipped.update(part.skipped)
+        merged.rejected.update(part.rejected)
+    merged.hits.sort(key=lambda h: h.result.score, reverse=True)
+    return merged
+
+
+def cmd_daily(args, transport=None) -> int:
+    settings = _resolve_settings(args)
+    _attach_file_log(settings.log_file)
+    log = logging.getLogger(__name__)
+
+    loader = PriceLoader(
+        LoaderConfig(
+            cache_dir=Path(settings.cache_dir),
+            ttl_hours=settings.cache_ttl,
+            period_days=settings.history_days,
+            chunk_size=settings.chunk_size,
+        ),
+        csv_dir=settings.csv_dir or None,
+    )
+    cfg = ChannelConfig().replace(
+        min_score=settings.min_score,
+        require_volume=settings.require_volume,
+        min_volume_ratio=settings.min_volume_ratio,
+        breakout_window=settings.breakout_window,
+    )
+
+    report = _scan_with_settings(settings, loader, cfg)
+    state = AlertState(settings.state_file)
+    fresh = state.new_hits(report.hits)
+
+    stamp = date.today().isoformat()
+    out_dir = Path(settings.out_dir)
+    csv_path = reporting.write_csv(report, out_dir / f"hits-{stamp}.csv")
+
+    charts: list[Path] = []
+    if settings.plot and fresh:
+        charts = _render_charts(fresh[: settings.email.max_charts], loader, out_dir / "charts")
+
+    title = f"{stamp} · {len(fresh)} new breakout(s) · {', '.join(settings.markets)}"
+    html = reporting.format_html(report, fresh, title=title)
+    html_path = out_dir / f"report-{stamp}.html"
+    html_path.parent.mkdir(parents=True, exist_ok=True)
+    html_path.write_text(html, encoding="utf-8")
+
+    print(reporting.format_table(fresh or report.hits, top=40))
+    print(f"report: {html_path}", file=sys.stderr)
+    log.info("scan complete: %s | new=%d", reporting.format_summary(report), len(fresh))
+
+    email = settings.email
+    should_email = (
+        email.enabled
+        and not args.no_email
+        and not args.dry_run
+        and (fresh or email.send_when_empty)
+    )
+    if should_email:
+        attachments = []
+        if email.attach_csv and csv_path.exists() and csv_path.stat().st_size:
+            attachments.append(csv_path)
+        if email.attach_charts:
+            attachments.extend(charts)
+        subject = f"{email.subject_prefix} {title}" if email.subject_prefix else title
+        sent = send_email(
+            email.smtp(), subject, html, attachments=attachments, transport=transport or send_message
+        )
+        if not sent:
+            print("email delivery failed; see the log for details", file=sys.stderr)
+            return 2
+        print(f"email sent to {', '.join(email.recipients)}", file=sys.stderr)
+    elif args.dry_run:
+        print("dry run: no email sent", file=sys.stderr)
+
+    if fresh and not args.dry_run:
+        state.mark(fresh)
+    return 0
+
+
+def cmd_init_config(args) -> int:
+    path = write_example_config(args.path)
+    print(f"wrote {path}")
+    print("next: set the SMTP password in the environment, e.g.")
+    print("  Windows  setx CHANNEL_MONITOR_SMTP_PASSWORD \"your-app-password\"")
+    print("  macOS    export CHANNEL_MONITOR_SMTP_PASSWORD='your-app-password'")
+    return 0
+
+
 def cmd_universe(args) -> int:
     for code in load_universe(args.market, limit=args.limit, offline=args.offline):
         print(code)
@@ -277,6 +436,8 @@ def main(argv: list[str] | None = None) -> int:
         "scan": cmd_scan,
         "watch": cmd_watch,
         "explain": cmd_explain,
+        "daily": cmd_daily,
+        "init-config": cmd_init_config,
         "universe": cmd_universe,
         "selftest": cmd_selftest,
     }
